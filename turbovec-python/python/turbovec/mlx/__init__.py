@@ -59,6 +59,7 @@ class TurboQuantIndex:
         self._centroids = mx.array(centroids_np)
 
         self._quantize_pack = _kernels.build_quantize_pack_kernel(dim, bit_width)
+        self._score = _kernels.build_score_kernel(dim, bit_width)
         self._packed_codes: "mx.array | None" = None
         self._norms: "mx.array | None" = None
 
@@ -111,4 +112,36 @@ class TurboQuantIndex:
         self._n += n
 
     def search(self, queries, k: int):
-        raise NotImplementedError("MLX search kernel — phase 3")
+        """Return the top-``k`` ``(scores, indices)`` for each query.
+
+        ``queries`` may be a numpy array or an ``mx.array`` of shape
+        ``(nq, dim)``, dtype ``float32``. Returns numpy arrays of shape
+        ``(nq, effective_k)`` where ``effective_k = min(k, len(index))``,
+        with dtypes ``float32`` and ``int64`` respectively — matching
+        the CPU :meth:`turbovec.TurboQuantIndex.search` signature.
+        """
+        if not isinstance(queries, mx.array):
+            queries = mx.array(np.ascontiguousarray(queries, dtype=np.float32))
+        if queries.ndim != 2 or queries.shape[1] != self._dim:
+            raise ValueError(
+                f"expected shape (nq, {self._dim}), got {tuple(queries.shape)}"
+            )
+        nq = queries.shape[0]
+
+        if self._packed_codes is None or self._n == 0:
+            return (
+                np.zeros((nq, 0), dtype=np.float32),
+                np.zeros((nq, 0), dtype=np.int64),
+            )
+
+        effective_k = min(k, self._n)
+        q_rot = queries @ self._rotation.T
+        scores = self._score(q_rot, self._packed_codes, self._centroids, self._norms)
+
+        idx = mx.argsort(-scores, axis=1)[:, :effective_k]
+        top_scores = mx.take_along_axis(scores, idx, axis=1)
+
+        return (
+            np.asarray(top_scores),
+            np.asarray(idx).astype(np.int64),
+        )

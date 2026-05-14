@@ -66,10 +66,13 @@ def test_index_construction_rejects_bad_bit_width():
         TurboQuantIndex(dim=64, bit_width=3)
 
 
-def test_phase3_search_still_stubbed():
+def test_search_empty_index_returns_empty():
     index = TurboQuantIndex(dim=64, bit_width=4)
-    with pytest.raises(NotImplementedError):
-        index.search(np.zeros((1, 64), dtype=np.float32), k=10)
+    scores, indices = index.search(np.zeros((2, 64), dtype=np.float32), k=10)
+    assert scores.shape == (2, 0)
+    assert indices.shape == (2, 0)
+    assert scores.dtype == np.float32
+    assert indices.dtype == np.int64
 
 
 def _random_unit_vectors(n, dim, seed):
@@ -132,3 +135,107 @@ def test_add_accumulates_across_calls():
     assert len(index) == 17
     assert index._packed_codes.shape == (17, bit_width * dim // 8)
     assert index._norms.shape == (17,)
+
+
+def _numpy_scores(packed, centroids, norms, q_rot, bit_width, dim):
+    """Pure-numpy reference scorer mirroring the MLX kernel.
+
+    Decodes the bit-plane packed bytes back to integer codes, looks up
+    centroid values, dot-products with the rotated query, and scales by
+    norms. Used as a precision-independent oracle for the MLX scoring
+    kernel — does not match the Rust u8-LUT path exactly.
+    """
+    n_db, bytes_per_vec = packed.shape
+    plane_size = dim // 8
+    codes = np.zeros((n_db, dim), dtype=np.uint8)
+    bit_pos = 7 - (np.arange(dim) % 8)
+    byte_pos = np.arange(dim) // 8
+    for p in range(bit_width):
+        plane = packed[:, p * plane_size:(p + 1) * plane_size]
+        bits = (plane[:, byte_pos] >> bit_pos) & 1
+        codes |= bits.astype(np.uint8) << p
+    decoded = centroids[codes]                       # (n_db, dim)
+    return (q_rot @ decoded.T) * norms[None, :]      # (nq, n_db)
+
+
+@pytest.mark.parametrize("bit_width", [2, 4])
+@pytest.mark.parametrize("dim", [64, 128, 1536])
+def test_search_matches_numpy_oracle(dim, bit_width):
+    """The MLX scoring kernel matches a pure-numpy reference.
+
+    Independent of the Rust path — proves the kernel computes
+    ``sum_j q_rot[j] * centroids[code_j] * norms[v]`` correctly.
+    """
+    from turbovec._turbovec import codebook as rust_codebook
+    from turbovec._turbovec import make_rotation_matrix as rust_make_rotation_matrix
+
+    n_db, n_q, k = 64, 4, 8
+    db = _random_unit_vectors(n_db, dim, seed=30)
+    queries = _random_unit_vectors(n_q, dim, seed=31)
+
+    index = TurboQuantIndex(dim=dim, bit_width=bit_width)
+    index.add(db)
+    mlx_scores, mlx_idx = index.search(queries, k=k)
+
+    R = rust_make_rotation_matrix(dim)
+    _, centroids = rust_codebook(bit_width, dim)
+    q_rot = queries @ R.T
+    packed = np.asarray(index._packed_codes)
+    norms = np.asarray(index._norms)
+    full_scores = _numpy_scores(packed, centroids, norms, q_rot, bit_width, dim)
+
+    expected_idx = np.argsort(-full_scores, axis=1)[:, :k]
+    expected_scores = np.take_along_axis(full_scores, expected_idx, axis=1)
+
+    # Returned top-k set matches numpy oracle exactly (no precision
+    # divergence — MLX uses the same fp32 dequantize-and-dot path).
+    for q in range(n_q):
+        assert set(mlx_idx[q].tolist()) == set(expected_idx[q].tolist())
+    np.testing.assert_allclose(
+        np.sort(mlx_scores, axis=1),
+        np.sort(expected_scores, axis=1),
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("bit_width", [2, 4])
+@pytest.mark.parametrize("dim", [64, 128, 1536])
+def test_search_recall_vs_rust(dim, bit_width):
+    """Recall@k against the Rust CPU search.
+
+    The Rust path runs u8-LUT FastScan; MLX runs straight fp32
+    dequantize-and-dot. Both compute the same TurboQuant scoring
+    function but with different precision, so the top-k boundary can
+    swap when consecutive scores are tied within u8-LUT rounding.
+    We require recall@k >= 0.9 (typically 1.0 in the interior and
+    occasionally drops a single boundary slot).
+    """
+    from turbovec import TurboQuantIndex as RustIndex
+
+    n_db, n_q, k = 256, 8, 10
+    db = _random_unit_vectors(n_db, dim, seed=10)
+    queries = _random_unit_vectors(n_q, dim, seed=11)
+
+    rust = RustIndex(dim=dim, bit_width=bit_width)
+    rust.add(db)
+    _, rust_idx = rust.search(queries, k=k)
+
+    mlx_index = TurboQuantIndex(dim=dim, bit_width=bit_width)
+    mlx_index.add(db)
+    _, mlx_idx = mlx_index.search(queries, k=k)
+
+    recalls = [
+        len(set(rust_idx[q].tolist()) & set(mlx_idx[q].tolist())) / k
+        for q in range(n_q)
+    ]
+    mean_recall = sum(recalls) / n_q
+    assert mean_recall >= 0.9, f"mean recall@{k} = {mean_recall:.3f}, recalls={recalls}"
+
+
+def test_search_returns_fewer_than_k_when_index_small():
+    dim, bit_width = 64, 4
+    index = TurboQuantIndex(dim=dim, bit_width=bit_width)
+    index.add(_random_unit_vectors(3, dim, seed=20))
+    scores, idx = index.search(_random_unit_vectors(2, dim, seed=21), k=10)
+    assert scores.shape == (2, 3)
+    assert idx.shape == (2, 3)
