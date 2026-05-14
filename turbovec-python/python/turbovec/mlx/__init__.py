@@ -61,8 +61,9 @@ class TurboQuantIndex:
         self._quantize_pack = _kernels.build_quantize_pack_kernel(dim, bit_width)
         self._score = _kernels.build_score_kernel(dim, bit_width)
         self._qb = 16
+        self._vb = 1
         self._score_batched = _kernels.build_score_batched_kernel(
-            dim, bit_width, qb=self._qb
+            dim, bit_width, qb=self._qb, vb=self._vb,
         )
         self._packed_codes: "mx.array | None" = None
         self._norms: "mx.array | None" = None
@@ -231,18 +232,34 @@ class TurboQuantIndex:
         q_rot = queries @ self._rotation.T
         # Use the query-batched kernel when nq is large enough that
         # amortizing code loads across the QB-batch beats the per-call
-        # padding waste. The break-even is roughly nq >= qb.
+        # padding waste. The break-even is roughly nq >= qb. Queries
+        # are cast to fp16 before the kernel call to halve q_rot
+        # memory bandwidth; the centroid * q_rot product is the
+        # precision-sensitive part and stays fp32-accumulated.
         if nq >= self._qb:
-            pad = (-nq) % self._qb
-            if pad:
+            q_pad = (-nq) % self._qb
+            if q_pad:
                 q_rot = mx.concatenate(
-                    [q_rot, mx.zeros((pad, self._dim), dtype=q_rot.dtype)],
+                    [q_rot, mx.zeros((q_pad, self._dim), dtype=q_rot.dtype)],
                     axis=0,
                 )
-            scores_padded = self._score_batched(
-                q_rot, self._packed_codes, self._centroids, self._norms
-            )
-            scores = scores_padded[:nq] if pad else scores_padded
+            q_rot_h = q_rot.astype(mx.float16)
+
+            v_pad = (-self._n) % self._vb
+            packed = self._packed_codes
+            norms = self._norms
+            if v_pad:
+                packed = mx.concatenate(
+                    [packed, mx.zeros((v_pad, self._bytes_per_vec), dtype=packed.dtype)],
+                    axis=0,
+                )
+                norms = mx.concatenate(
+                    [norms, mx.zeros((v_pad,), dtype=norms.dtype)],
+                    axis=0,
+                )
+
+            scores_padded = self._score_batched(q_rot_h, packed, self._centroids, norms)
+            scores = scores_padded[:nq, : self._n] if (q_pad or v_pad) else scores_padded
         else:
             scores = self._score(
                 q_rot, self._packed_codes, self._centroids, self._norms
