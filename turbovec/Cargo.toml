@@ -11,6 +11,13 @@ readme = "../README.md"
 keywords = ["vector-search", "quantization", "nearest-neighbor", "ann", "simd"]
 categories = ["algorithms", "science", "compression"]
 
+[features]
+default = []
+# Requires nightly Rust today because avx512f/avx512bw target features are not
+# stable. Stable builds keep the AVX2/scalar dispatch path even with all
+# features enabled.
+avx512bw = []
+
 [dependencies]
 ndarray = "0.17"
 rayon = "1.10"
@@ -29,4 +36,3 @@ ndarray = { version = "0.17", features = ["blas"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ndarray = { version = "0.17", features = ["blas"] }
-

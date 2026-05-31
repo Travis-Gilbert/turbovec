@@ -385,7 +385,7 @@ unsafe fn search_multi_query_avx2(
 // Tail (when `n_blocks` is odd) processes the final unpaired block via an
 // inlined AVX2 inner-loop body at the end. Avoids any masked AVX-512 logic.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512bw", turbovec_nightly))]
 #[target_feature(enable = "avx2", enable = "fma", enable = "avx512f", enable = "avx512bw")]
 unsafe fn search_multi_query_avx512bw(
     blocked_codes: &[u8],
@@ -1705,15 +1705,23 @@ pub fn search(
                 let mut heap_min_idxs = vec![0usize; batch_nq];
 
                 unsafe {
-                    if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
-                        search_multi_query_avx512bw(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
-                            batch_nq, k, mask,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                        );
-                    } else if is_x86_feature_detected!("avx2") {
+                    let mut searched = false;
+
+                    #[cfg(all(feature = "avx512bw", turbovec_nightly))]
+                    {
+                        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
+                            search_multi_query_avx512bw(
+                                blocked_codes, &lut_refs, &scale_vals, &bias_vals,
+                                n_byte_groups, vec_scales, n_vectors,
+                                batch_nq, k, mask,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                            searched = true;
+                        }
+                    }
+
+                    if !searched && is_x86_feature_detected!("avx2") {
                         search_multi_query_avx2(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, vec_scales, n_vectors,
@@ -1721,7 +1729,10 @@ pub fn search(
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
-                    } else {
+                        searched = true;
+                    }
+
+                    if !searched {
                         // Neither AVX-512 BW nor AVX2 detected at runtime on
                         // this x86_64 CPU. Previously this fell through to
                         // an empty `unsafe { }` block and `heap_sizes` stayed
