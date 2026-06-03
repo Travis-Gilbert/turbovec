@@ -683,7 +683,10 @@ unsafe fn search_multi_query_avx512bw(
 /// FMAs `v_scale * partial` into the running f32 accumulators `fa`. Mirrors
 /// the per-flush fmadd sequence used by `score_4bit_block_neon` on ARM so
 /// scores across arches differ only by tied-rank f32 swaps.
+// Only the AVX-512BW kernel calls this; the AVX2 kernel inlines its epilogue.
+// It is therefore unused once the AVX-512 path is gated out of stable builds.
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn avx2_batch_flush_to_fa(
     accus: [std::arch::x86_64::__m256i; 4],
@@ -720,7 +723,10 @@ unsafe fn avx2_batch_flush_to_fa(
 /// `bias + Σ scale*partial`), applies the per-vector `vec_scales` multiplier,
 /// then runs the in-register-threshold-prune + heap-update logic for one block.
 /// Used by both the AVX2 and AVX-512BW kernels after their flush loops.
+// AVX-512BW-only in practice (the AVX2 kernel inlines its epilogue), so unused
+// once the AVX-512 path is gated out of stable builds.
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn avx2_post_flush_heap_update(
     fa: &[std::arch::x86_64::__m256; 4],
@@ -871,13 +877,16 @@ unsafe fn avx2_post_flush_heap_update(
 /// for one block and runs combine + convert + fmadd + norm-mul + heap update
 /// for each query. Mirrors the inline epilogue inside `search_multi_query_avx2`
 /// byte-for-byte so scores are bit-identical.
+// Dead helper (the AVX2 kernel inlines this epilogue inline); kept for a future
+// dedup of that inline epilogue, so allow rather than delete.
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn avx2_block_epilogue(
     accus: &mut [[std::arch::x86_64::__m256i; 4]; 4],
     base_vec: usize,
     end: usize,
-    n_byte_groups: usize,
+    _n_byte_groups: usize,
     vec_scales_ptr: *const f32,
     scales: &[f32],
     biases: &[f32],
@@ -1318,7 +1327,9 @@ pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
 /// two adjacent 32-vector blocks per zmm iteration. The 64-vector pair
 /// aligns to a single `u64` word, so a zero word means neither block has
 /// allowed slots and the entire SIMD pair can be skipped.
+// AVX-512BW pair predicate; unused once the AVX-512 path is gated out of stable.
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize) -> bool {
     match mask {
@@ -1414,6 +1425,96 @@ fn score_query_into_heap(
             }
         }
     }
+}
+
+// Test-only switch that forces `search` down the scalar
+// `score_query_into_heap` path on any architecture, so the
+// AVX-512 -> AVX2 -> scalar fallback the stable build relies on can be
+// exercised on the test host regardless of its SIMD capabilities. It is a
+// thread-local so parallel tests do not contend, and the dispatch decision is
+// read on the calling thread before any rayon fan-out. In non-test builds it
+// is a constant `false`, so the SIMD dispatch is unaffected and zero-cost.
+#[cfg(test)]
+thread_local! {
+    static SCALAR_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn scalar_forced() -> bool {
+    SCALAR_FORCED.with(|c| c.get())
+}
+
+/// Set the thread-local force-scalar switch (test-only).
+#[cfg(test)]
+pub(crate) fn set_scalar_forced(value: bool) {
+    SCALAR_FORCED.with(|c| c.set(value));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn scalar_forced() -> bool {
+    false
+}
+
+/// Score every query through the per-query scalar kernel and return per-query
+/// (scores, indices) sorted descending. This is the architecture-independent
+/// fallback `search` uses when no SIMD kernel is available at runtime (the
+/// non-x86_64 / non-aarch64 build, the x86_64 "neither AVX-512 nor AVX2
+/// detected" branch, and the force-scalar test path). Sharing one
+/// implementation keeps the fallback that abb0436 wired in from drifting away
+/// from the SIMD paths it backs up.
+#[allow(clippy::too_many_arguments)]
+fn scalar_batch_search(
+    query_luts: &[QueryNeonLut],
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    n_byte_groups: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    mask: Option<&[u64]>,
+    k: usize,
+    nq: usize,
+) -> Vec<(Vec<f32>, Vec<i64>)> {
+    (0..nq)
+        .into_par_iter()
+        .map(|qi| {
+            let qlut = &query_luts[qi];
+            let mut heap_s = vec![f32::NEG_INFINITY; k];
+            let mut heap_i = vec![0u32; k];
+            let mut heap_sz = 0usize;
+            let mut heap_min = f32::NEG_INFINITY;
+            let mut heap_mi = 0usize;
+            score_query_into_heap(
+                &qlut.uint8_luts,
+                qlut.scale,
+                qlut.bias,
+                blocked_codes,
+                vec_scales,
+                n_byte_groups,
+                n_vectors,
+                n_blocks,
+                mask,
+                k,
+                &mut heap_s,
+                &mut heap_i,
+                &mut heap_sz,
+                &mut heap_min,
+                &mut heap_mi,
+            );
+            let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz]
+                .iter()
+                .zip(heap_i[..heap_sz].iter())
+                .map(|(&s, &i)| (s, i))
+                .collect();
+            pairs.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            (
+                pairs.iter().map(|p| p.0).collect(),
+                pairs.iter().map(|p| p.1 as i64).collect(),
+            )
+        })
+        .collect()
 }
 
 /// Apply TQ+ per-coord (shift, scale) calibration to a batch of rotated
@@ -1531,7 +1632,12 @@ pub fn search(
 
     // Platform-specific scoring + top-k
     #[cfg(target_arch = "aarch64")]
-    let results = {
+    let results = if scalar_forced() {
+        scalar_batch_search(
+            &query_luts, blocked_codes, vec_scales, n_byte_groups, n_vectors,
+            n_blocks, mask, k, nq,
+        )
+    } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
         const QBS: usize = 4;
         let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
@@ -1670,7 +1776,12 @@ pub fn search(
     };
 
     #[cfg(target_arch = "x86_64")]
-    let results = {
+    let results = if scalar_forced() {
+        scalar_batch_search(
+            &query_luts, blocked_codes, vec_scales, n_byte_groups, n_vectors,
+            n_blocks, mask, k, nq,
+        )
+    } else {
         const NQ_BATCH: usize = 4;
         let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
             .step_by(NQ_BATCH)
@@ -1780,42 +1891,10 @@ pub fn search(
     };
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let results = {
-        // Scalar fallback for architectures without a SIMD kernel.
-        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
-            .into_par_iter()
-            .map(|qi| {
-                let qlut = &query_luts[qi];
-                let mut heap_s = vec![f32::NEG_INFINITY; k];
-                let mut heap_i = vec![0u32; k];
-                let mut heap_sz = 0usize;
-                let mut heap_min = f32::NEG_INFINITY;
-                let mut heap_mi = 0usize;
-                score_query_into_heap(
-                    &qlut.uint8_luts,
-                    qlut.scale,
-                    qlut.bias,
-                    blocked_codes,
-                    vec_scales,
-                    n_byte_groups,
-                    n_vectors,
-                    n_blocks,
-                    mask,
-                    k,
-                    &mut heap_s,
-                    &mut heap_i,
-                    &mut heap_sz,
-                    &mut heap_min,
-                    &mut heap_mi,
-                );
-                let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
-                    .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
-                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())
-            })
-            .collect();
-        results
-    };
+    let results = scalar_batch_search(
+        &query_luts, blocked_codes, vec_scales, n_byte_groups, n_vectors,
+        n_blocks, mask, k, nq,
+    );
 
     // Flatten into (scores, indices)
     let mut all_scores = Vec::with_capacity(nq * k);
@@ -1829,4 +1908,146 @@ pub fn search(
     }
 
     (all_scores, all_indices)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use crate::TurboQuantIndex;
+
+    // Single-byte-group block of `n` vectors (n <= 16 keeps each nibble in
+    // 0..16) where vector i has nibbles (i, i) and the LUT maps nibble v -> v,
+    // so score(i) = scale * (lut[hi] + lut[lo]) * vec_scale = 1 * (i + i) * 1
+    // = 2*i. The scalar scorer must pick the highest scores and must never
+    // leave the heap empty: the abb0436 bug was an empty `unsafe {}` block that
+    // left heap_sizes at 0, so search silently returned no results.
+    fn score_tiny(n: usize, k: usize) -> (usize, Vec<(f32, u32)>) {
+        assert!(n <= 16, "score_tiny keeps nibbles in 0..16");
+        let n_byte_groups = 1;
+        let n_blocks = 1;
+        let mut blocked_codes = vec![0u8; n_blocks * n_byte_groups * BLOCK];
+        for i in 0..n {
+            blocked_codes[i] = ((i as u8) << 4) | (i as u8);
+        }
+        let vec_scales = vec![1.0f32; n];
+        let mut lut = vec![0u8; n_byte_groups * 32];
+        for v in 0..16usize {
+            lut[v] = v as u8;
+            lut[16 + v] = v as u8;
+        }
+
+        let mut heap_s = vec![f32::NEG_INFINITY; k];
+        let mut heap_i = vec![0u32; k];
+        let mut heap_sz = 0usize;
+        let mut heap_min = f32::NEG_INFINITY;
+        let mut heap_mi = 0usize;
+        score_query_into_heap(
+            &lut, 1.0, 0.0, &blocked_codes, &vec_scales, n_byte_groups, n,
+            n_blocks, None, k, &mut heap_s, &mut heap_i, &mut heap_sz,
+            &mut heap_min, &mut heap_mi,
+        );
+        let pairs: Vec<(f32, u32)> = heap_s[..heap_sz]
+            .iter()
+            .zip(heap_i[..heap_sz].iter())
+            .map(|(&s, &i)| (s, i))
+            .collect();
+        (heap_sz, pairs)
+    }
+
+    #[test]
+    fn scalar_scorer_selects_top_k() {
+        let (sz, pairs) = score_tiny(4, 2);
+        assert_eq!(sz, 2);
+        let mut idxs: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![2, 3], "top-2 of score(i)=2i must be vectors 2 and 3");
+        let best = pairs.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(best, 6.0, "score(3) = 2*3");
+    }
+
+    #[test]
+    fn scalar_scorer_returns_all_when_k_exceeds_n() {
+        let (sz, pairs) = score_tiny(4, 10);
+        assert_eq!(sz, 4, "k>n must return all n, not pad");
+        let mut idxs: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn scalar_scorer_is_never_empty_for_nonempty_index() {
+        for &n in &[1usize, 2, 4, 8, 16] {
+            let (sz, _) = score_tiny(n, 5);
+            assert_eq!(sz, n.min(5), "n={} left the heap empty/short", n);
+        }
+    }
+
+    fn tiny_gaussian(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut data = vec![0.0f32; n * dim];
+        for x in data.iter_mut() {
+            *x = ((next() >> 40) as f32 / (1u32 << 24) as f32) - 0.5;
+        }
+        for row_i in 0..n {
+            let row = &mut data[row_i * dim..(row_i + 1) * dim];
+            let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for v in row.iter_mut() {
+                    *v *= inv;
+                }
+            }
+        }
+        data
+    }
+
+    // Forcing the scalar path on this host and comparing against the SIMD
+    // result proves the fallback that `search` selects when no SIMD kernel is
+    // available returns correct, non-empty top-k through the real public API.
+    #[test]
+    fn forced_scalar_fallback_matches_simd_and_is_nonempty() {
+        let dim = 256;
+        let bits = 4;
+        let n = 128;
+        let data = tiny_gaussian(n, dim, 0xABCD_1234);
+        let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+        idx.add(&data);
+        assert_eq!(idx.len(), n);
+
+        let nq = 4;
+        let q = &data[..nq * dim];
+        let k = 5;
+
+        let simd = idx.search(q, k);
+
+        set_scalar_forced(true);
+        let scalar = idx.search(q, k);
+        set_scalar_forced(false);
+
+        for qi in 0..nq {
+            let s_idx = scalar.indices_for_query(qi);
+            assert!(
+                !s_idx.is_empty(),
+                "scalar fallback returned empty top-k at qi={} (the abb0436 bug)",
+                qi
+            );
+            assert_eq!(s_idx.len(), k, "scalar fallback returned short top-k at qi={}", qi);
+
+            let mut got: Vec<i64> = s_idx.to_vec();
+            let mut want: Vec<i64> = simd.indices_for_query(qi).to_vec();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(
+                got, want,
+                "scalar fallback disagrees with the SIMD kernel at qi={}",
+                qi
+            );
+        }
+    }
 }
