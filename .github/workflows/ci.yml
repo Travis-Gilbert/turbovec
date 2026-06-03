@@ -38,6 +38,31 @@ jobs:
       - name: Downstream consumer smoke test
         run: cargo run --release --manifest-path examples/downstream-smoke/Cargo.toml
 
+  # Guards the nightly-gated AVX-512 kernel from rotting while it is gated out
+  # of the stable build (the contract of the stable-avx512-gate patch).
+  avx512-gate:
+    name: AVX-512 gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      # On nightly, build.rs sets turbovec_nightly, so the avx512bw kernel
+      # compiles (and runs, if the runner CPU exposes AVX-512). This is the
+      # only configuration in which that kernel is built at all.
+      - name: Build + test avx512bw kernel (nightly)
+        run: cargo +nightly test -p turbovec --features avx512bw --release
+
+      # Stable must build even with the feature requested, keeping the AVX-512
+      # path gated out (no turbovec_nightly cfg). This proves the gate holds.
+      - name: Confirm stable gates AVX-512 out
+        run: cargo build -p turbovec --features avx512bw --release
+
   python:
     name: Python (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
